@@ -58,8 +58,7 @@ function pqap_stop(){
 }
 
 # Exit if the specified interface is not present
-function ensure_interface_up(){
-
+function check_and_ensure_interface_up(){
     ifconfig $1 up
 
     local output=`ifconfig |grep -o $1`;
@@ -70,18 +69,6 @@ function ensure_interface_up(){
         exit
     fi
 }
-
-# Return 1 if the interface is present, 0 otherwise
-function is_interface_up(){
-
-    local output=`ifconfig |grep -o $1`;
-    if [ "$output" == "$1" ] ; then
-	    echo 1; 
-    else
-        echo 0;
-    fi
-}
-
 
 function start_openvpn(){
 
@@ -110,7 +97,54 @@ function start_openvpn(){
 
 function pqap_restart(){
     pqap_stop
-    pqap_start
+
+    check_deps
+
+    # We'll try to start openvpn, if we have internet it should connect
+    # If not, we'll just start the AP, so the user can configure the internet
+    start_openvpn
+
+
+    # If the tunnel is up, we'll route traffic too
+    have_tunnel=$(check_and_ensure_interface_up $INET_DEVICE)
+
+    # make sure iptables is not fowarding
+    iptables --flush
+    sysctl -w net.ipv4.ip_forward=0
+
+    ifconfig $AP_DEVICE 10.0.0.1/24 up
+
+    # (Re)Start dnsmasq
+    killall dnsmasq
+    dnsmasq -C $DNSMASQ_CONFIG -H $DNSMASQ_HOSTS --log-facility=$DNSMASQ_LOG
+   
+    # Start hostapd
+    # Only start hostapd if it's not already running; we don't want to 
+    # disconnect anyone that might be using the web UI
+    if ! (pgrep -x "hostapd" > /dev/null) ; then
+        # We need the AP device to start the hotspot 
+        check_and_ensure_interface_up $AP_DEVICE
+        hostapd $HOSTAPD_CONFIG -B -f $HOSTAPD_LOG 
+    fi
+    # Note if hostapd is already started, and changes to the interface are made,
+    # the AP can dissapear. The process runs but no AP is there. 
+    # For now we mainly call this script with restart to work around this. 
+
+    if [ "1" == "$have_tunnel" ] ; then 
+
+        echo 'Configuring IP tables to forward traffic from the access point to the VPN'
+        sysctl -w net.ipv4.ip_forward=1
+        iptables -P FORWARD ACCEPT
+        iptables --table nat -A POSTROUTING -o $INET_DEVICE -j MASQUERADE
+
+        # once the tunnel is up, change the DNS server
+        cp /etc/resolv.conf $RESOLV_CONF_BAK
+        echo "nameserver $AZURE_DNS_SERVER" >/etc/resolv.conf
+
+        # Make resolv.conf RO to prevent dhcpd or network manager from updating it
+        # e.g., if the lease on the uplink interface expires and dhcpd renews it
+        chattr +i /etc/resolv.conf
+    fi
 }
 
 function check_deps(){
@@ -135,58 +169,6 @@ function check_deps(){
     sleep 2
 }
 
-function pqap_start(){
-
-    check_deps
-
-    # We'll try to start openvpn, if we have internet it should connect
-    # If not, we'll just start the AP, so the user can configure the internet
-    start_openvpn
-
-
-    # If the tunnel is up, we'll route traffic too
-    have_tunnel=$(is_interface_up $INET_DEVICE)
-
-    # make sure iptables is not fowarding
-    iptables --flush
-    sysctl -w net.ipv4.ip_forward=0
-
-    ifconfig $AP_DEVICE 10.0.0.1/24 up
-
-    # (Re)Start dnsmasq
-    killall dnsmasq
-    dnsmasq -C $DNSMASQ_CONFIG -H $DNSMASQ_HOSTS --log-facility=$DNSMASQ_LOG
-   
-    # Start hostapd
-    # Only start hostapd if it's not already running; we don't want to 
-    # disconnect anyone that might be using the web UI
-    if ! (pgrep -x "hostapd" > /dev/null) ; then
-        # We need the AP device to start the hotspot 
-        ensure_interface_up $AP_DEVICE
-        hostapd $HOSTAPD_CONFIG -B -f $HOSTAPD_LOG 
-    fi
-    # Note if hostapd is already started, and changes to the interface are made,
-    # the AP can dissapear. The process runs but no AP is there. 
-    # For now we mainly call this script with restart to work around this. 
-
-    if [ "1" == "$have_tunnel" ] ; then 
-
-        echo 'Configuring IP tables to forward traffic from the access point to the VPN'
-        sysctl -w net.ipv4.ip_forward=1
-        iptables -P FORWARD ACCEPT
-        iptables --table nat -A POSTROUTING -o $INET_DEVICE -j MASQUERADE
-
-        # once the tunnel is up, change the DNS server
-        cp /etc/resolv.conf $RESOLV_CONF_BAK
-        echo "nameserver $AZURE_DNS_SERVER" >/etc/resolv.conf
-
-        # Make resolv.conf RO to prevent dhcpd or network manager from updating it
-        # e.g., if the lease on the uplink interface expires and dhcpd renews it
-        chattr +i /etc/resolv.conf
-    fi
-}
-
-
 #### main() ####
 
 cd /home/$HOSTNAME/vpn/
@@ -197,7 +179,7 @@ if [ "$1" = "stop" ] ; then
 
 elif [ "$1" = "start" ] ; then
 
-    pqap_start
+    pqap_restart
 
 elif [ "$1" = "restart" ] ; then
     pqap_restart
@@ -208,7 +190,3 @@ else
     echo "Usage:"
     echo "    $0 start|stop|restart"
 fi
-
-
-
-
